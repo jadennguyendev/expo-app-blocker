@@ -22,6 +22,11 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
   // Usage-step event-name prefix; the suffix is the threshold in seconds.
   private let usageStepEventPrefix = "appBlocker.usageStep."
   private let blockConfigStorageKey = "appBlocker.blockConfiguration.v1"
+  /// `stopMonitoring()` fires a spurious `intervalDidEnd` on re-grant. The host
+  /// writes `unlockGrantedAt` *before* that call, so a DidEnd within this window
+  /// is the leftover callback — not midnight. A sticky ignore-flag would skip the
+  /// next real midnight if Apple never delivers the spurious fire.
+  private let freshGrantSkipSeconds: TimeInterval = 5
 
   private let store = ManagedSettingsStore()
   private var sharedDefaults: UserDefaults?
@@ -73,26 +78,59 @@ class DeviceActivityMonitorExtension: DeviceActivityMonitor {
     }
   }
 
-  /// Fires at the schedule's interval end (23:59:59) — the daily reset. Clears any
-  /// unspent budget and re-applies the shield so earned time does not carry across
-  /// midnight.
+  /// Interval end of the unlock schedule (23:59:59, often delivered after 00:00)
+  /// or the repeating daily-reset activity. Expire unspent budget and re-apply
+  /// the shield — earned time does not carry across midnight.
   ///
-  /// Guards against the spurious callback that `stopMonitoring()` fires during a
-  /// re-grant: that fire happens whenever the user earns time, not at the day
-  /// boundary, so only honor it in the last couple of minutes before midnight.
+  /// Skip when the grant is brand-new: `stopMonitoring()` on re-grant fires a
+  /// spurious DidEnd, and `unlockGrantedAt` was just written. Do not gate on
+  /// `hour == 23`; Apple commonly delivers the real midnight callback at 00:00.
   override func intervalDidEnd(for activity: DeviceActivityName) {
     super.intervalDidEnd(for: activity)
 
-    let comps = Calendar.current.dateComponents([.hour, .minute], from: Date())
-    guard comps.hour == 23, (comps.minute ?? 0) >= 58 else {
+    if isFreshGrant() {
       return
     }
     clearUnlockState()
     reapplyBlockConfiguration()
   }
 
+  /// Unlock-interval start (user just earned time) and daily-reset start
+  /// (midnight, or first registration mid-day). Re-apply the shield unless a
+  /// same-day budget still remains — otherwise we'd instantly re-block a fresh
+  /// unlock, or a mid-day restart of the daily activity during an active grant.
   override func intervalDidStart(for activity: DeviceActivityName) {
     super.intervalDidStart(for: activity)
+
+    if remainingUnlockSeconds() > 0 {
+      return
+    }
+    clearUnlockState()
+    reapplyBlockConfiguration()
+  }
+
+  /// True when `unlockGrantedAt` is within `freshGrantSkipSeconds` — the
+  /// `stopMonitoring()` DidEnd from a re-grant, not a real interval end.
+  private func isFreshGrant() -> Bool {
+    guard let grantedAt = sharedDefaults?.object(forKey: unlockGrantedAtKey) as? Date else {
+      return false
+    }
+    return Date().timeIntervalSince(grantedAt) < freshGrantSkipSeconds
+  }
+
+  /// Mirror of `ExpoAppBlockerModule.remainingUnlockSeconds`: 0 if no budget,
+  /// fully consumed, or the grant is from a previous calendar day.
+  private func remainingUnlockSeconds() -> Int {
+    let budgetSeconds = (sharedDefaults?.object(forKey: temporaryUnlockKey) as? Int) ?? 0
+    if budgetSeconds <= 0 { return 0 }
+
+    if let grantedAt = sharedDefaults?.object(forKey: unlockGrantedAtKey) as? Date,
+       !Calendar.current.isDate(grantedAt, inSameDayAs: Date()) {
+      return 0
+    }
+
+    let consumedSeconds = (sharedDefaults?.object(forKey: usageConsumedKey) as? Int) ?? 0
+    return max(0, budgetSeconds - consumedSeconds)
   }
 
   /// Extract the threshold seconds from an event name like `appBlocker.usageStep.90`;

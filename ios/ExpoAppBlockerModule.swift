@@ -28,6 +28,10 @@ public class ExpoAppBlockerModule: Module {
   // for the monitor's premature-fire guard (usage can't exceed elapsed wall-clock).
   private let unlockGrantedAtKey = "appBlocker.unlockGrantedAt.v1"
   private let unlockActivityName = "appBlocker.temporaryUnlock"
+  // Repeating all-day interval whose only job is midnight relock (`intervalDidStart`
+  // at 00:00). Independent of the unlock activity so `stopMonitoring` on re-grant
+  // cannot disarm the day-boundary backstop. No usage events.
+  private let dailyResetActivityName = "appBlocker.dailyReset"
   // Sub-minute usage steps. We register one DeviceActivityEvent per `usageStepSeconds`
   // of the budget (threshold = k×step seconds of measured usage). Each step's
   // eventDidReachThreshold lets the monitor write consumed SECONDS back to the App
@@ -183,6 +187,7 @@ public class ExpoAppBlockerModule: Module {
       self.stateQueue.async {
         self.ensureLoadedPersistedConfig()
         self.cancelRelockActivity()
+        self.cancelDailyResetMonitoring()
         self.store.shield.applications = nil
         self.store.shield.applicationCategories = nil
         self.store.shield.webDomains = nil
@@ -479,11 +484,14 @@ public class ExpoAppBlockerModule: Module {
 
   private func applyBlocks(_ config: BlockConfig) throws {
     guard config.isActive else {
+      cancelDailyResetMonitoring()
       store.shield.applications = nil
       store.shield.applicationCategories = nil
       store.shield.webDomains = nil
       return
     }
+
+    startDailyResetMonitoring()
 
     if isTemporarilyUnlockedInternal() {
       store.shield.applications = nil
@@ -553,7 +561,9 @@ public class ExpoAppBlockerModule: Module {
   ///
   /// The interval ends at 23:59:59 so the monitor's `intervalDidEnd` clears any
   /// unspent budget at the day boundary (earned time does not carry across midnight).
-  /// `repeats: false` because we re-register on every unlock.
+  /// `repeats: false` because we re-register on every unlock. A separate repeating
+  /// daily-reset activity (`startDailyResetMonitoring`) is the backstop when Apple
+  /// misses that DidEnd.
   ///
   /// Note: Apple's usage thresholds are coarse/unreliable below ~a minute, so the
   /// finest steps may fire late or be skipped — later steps and the final threshold
@@ -576,6 +586,8 @@ public class ExpoAppBlockerModule: Module {
       print("[AppBlocker] startUsageBasedRelock: no blockable tokens, monitoring not started")
       return
     }
+
+    startDailyResetMonitoringLocked()
 
     let budget = max(1, budgetSeconds)
     // Step by usageStepSeconds, but coarsen so we never exceed maxUsageSteps events.
@@ -629,6 +641,43 @@ public class ExpoAppBlockerModule: Module {
   private func cancelRelockActivityLocked() {
     let activityName = DeviceActivityName(unlockActivityName)
     activityCenter.stopMonitoring([activityName])
+  }
+
+  /// Arm a repeating [00:00, 23:59:59] DeviceActivity with no usage events.
+  /// `intervalDidStart` at midnight re-applies the shield if yesterday's grant is
+  /// stale — covering the case where the unlock interval's `intervalDidEnd` is
+  /// late (00:00) or never delivered, and the host app is not in the foreground.
+  /// No-op when that activity is already monitored so a mid-day re-register
+  /// does not restart the interval.
+  private func startDailyResetMonitoring() {
+    scheduleLock.lock()
+    defer { scheduleLock.unlock() }
+    startDailyResetMonitoringLocked()
+  }
+
+  private func startDailyResetMonitoringLocked() {
+    let name = DeviceActivityName(dailyResetActivityName)
+    if activityCenter.activities.contains(name) {
+      return
+    }
+
+    let schedule = DeviceActivitySchedule(
+      intervalStart: DateComponents(hour: 0, minute: 0, second: 0),
+      intervalEnd: DateComponents(hour: 23, minute: 59, second: 59),
+      repeats: true
+    )
+
+    do {
+      try activityCenter.startMonitoring(name, during: schedule)
+    } catch {
+      print("[AppBlocker] startDailyResetMonitoring failed: \(error.localizedDescription)")
+    }
+  }
+
+  private func cancelDailyResetMonitoring() {
+    scheduleLock.lock()
+    defer { scheduleLock.unlock() }
+    activityCenter.stopMonitoring([DeviceActivityName(dailyResetActivityName)])
   }
 
   private func isTemporarilyUnlockedInternal() -> Bool {

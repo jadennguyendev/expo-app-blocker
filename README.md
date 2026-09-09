@@ -516,7 +516,7 @@ await relockApps();                        // drop the budget now, re-block imme
 | Mechanism | Foreground-service poll consumes the budget each tick spent inside a blocked app | DeviceActivity usage-threshold events stepped ~every 30s of the budget; the monitor extension records consumed seconds and re-applies the shield on the final step |
 | `getRemainingUnlockTime()` | Live — ticks down by the second while inside a blocked app, freezes otherwise | **~30s-granular** — steps down as measured usage accrues (the monitor writes consumed seconds to the App Group), freezes when the apps aren't used |
 | `isTemporarilyUnlocked()` | Returns `false` (use `getRemainingUnlockTime() > 0`) | `true` while budget remains |
-| Caveats | — | Apple thresholds are coarse/unreliable below ~a minute, so the finest steps may fire late or be skipped (later steps + the final threshold still re-block, bounding overshoot to ~one step); large budgets auto-coarsen the step to stay under the event cap; unspent budget is cleared at the daily boundary (midnight) |
+| Caveats | — | Apple thresholds are coarse/unreliable below ~a minute, so the finest steps may fire late or be skipped (later steps + the final threshold still re-block, bounding overshoot to ~one step); large budgets auto-coarsen the step to stay under the event cap; unspent budget is cleared at the daily boundary (midnight) by the DeviceActivity monitor (`intervalDidEnd` of the unlock schedule, plus `intervalDidStart` of a repeating all-day activity) so the shield re-applies even if the host app is not in the foreground |
 
 > **Android only:** when the budget runs out while the user is still inside a
 > blocked app, the deep link fires with `reason=expired` (see
