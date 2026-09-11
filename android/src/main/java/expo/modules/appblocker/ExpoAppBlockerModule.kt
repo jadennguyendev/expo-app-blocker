@@ -1,6 +1,5 @@
 package expo.modules.appblocker
 
-import android.app.AppOpsManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
@@ -38,7 +37,7 @@ class ExpoAppBlockerModule : Module() {
     }
 
     AsyncFunction("checkUsageStatsPermission") {
-      hasUsageStatsPermission()
+      context.hasUsageStatsAccess()
     }
 
     AsyncFunction("checkNotificationPermission") {
@@ -198,8 +197,6 @@ class ExpoAppBlockerModule : Module() {
     }
   }
 
-  private fun hasUsageStatsPermission(): Boolean = context.hasUsageStatsAccess()
-
   /**
    * Structured additive-unlock result for JS. `status` mirrors the TS
    * AddUnlockTimeStatus union: added / duplicate / not_authorized /
@@ -227,7 +224,7 @@ class ExpoAppBlockerModule : Module() {
     }
 
     return try {
-      if (!Settings.canDrawOverlays(context) || !hasUsageStatsPermission()) {
+      if (!Settings.canDrawOverlays(context) || !context.hasUsageStatsAccess()) {
         return fail("not_authorized", "Overlay and usage-stats permissions are required")
       }
       if (AppBlockerPrefs.getBlockedPackages(context).isEmpty()) {

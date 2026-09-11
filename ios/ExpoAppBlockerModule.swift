@@ -306,10 +306,15 @@ public class ExpoAppBlockerModule: Module {
           fail("no_blocked_apps", "No blocked apps selected")
           return
         }
-        guard self.sharedDefaults != nil else {
+        guard let defaults = self.sharedDefaults else {
           fail("native_error", "App Group storage unavailable")
           return
         }
+
+        // Refresh the cached suite so consumption written by the (separate)
+        // monitor-extension process is reflected in the remainder we carry
+        // over - without this the add could over-grant by a stale under-count.
+        defaults.synchronize()
 
         if self.hasAppliedUnlockRequest(requestId) {
           // The identical request already granted this time - report success

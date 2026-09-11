@@ -25,7 +25,7 @@ class TemporaryUnlockController(private val context: Context) {
     get() = Store.remainingMs(context) > 0
 
   /** Outcome of [addBlocking]. */
-  data class AddResult(val added: Boolean, val duplicate: Boolean, val remainingMs: Long)
+  data class AddResult(val duplicate: Boolean, val remainingMs: Long)
 
   /** Grant a fresh budget of [durationMinutes], replacing any existing balance. No-op if <= 0. */
   fun grant(durationMinutes: Int) {
@@ -46,7 +46,6 @@ class TemporaryUnlockController(private val context: Context) {
     synchronized(Store.LOCK) {
       if (AppBlockerPrefs.hasAppliedUnlockRequest(context, requestId)) {
         return AddResult(
-          added = false,
           duplicate = true,
           remainingMs = Store.remainingMs(context)
         )
@@ -54,7 +53,7 @@ class TemporaryUnlockController(private val context: Context) {
       val remaining = Store.remainingMs(context) + durationMs
       Store.setRemaining(context, remaining)
       AppBlockerPrefs.recordAppliedUnlockRequest(context, requestId)
-      return AddResult(added = true, duplicate = false, remainingMs = remaining)
+      return AddResult(duplicate = false, remainingMs = remaining)
     }
   }
 

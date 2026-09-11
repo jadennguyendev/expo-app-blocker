@@ -529,7 +529,9 @@ const result = await addUnlockTime(5, 'session-or-batch-id');
   time** (batch id, session id, …). The applied-id record is persisted
   natively, so a retried request cannot add the same time twice - even across
   JS reloads and app restarts. Only successful additions are recorded; a
-  failed request stays retryable.
+  failed request stays retryable. The record is a bounded FIFO of the 100 most
+  recent ids - an id older than that can apply again, which only matters for
+  flows that retry a request across 100+ intervening grants.
 - The call **never rejects** - inspect `result.status` for the outcome.
 - `remainingSeconds` is the best-known remaining budget: exact on Android,
   ~30-second granular on iOS (see table below).
