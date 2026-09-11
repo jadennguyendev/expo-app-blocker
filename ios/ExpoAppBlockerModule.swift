@@ -45,6 +45,11 @@ public class ExpoAppBlockerModule: Module {
   private let maxUsageSteps = 60
   private let pendingUnlockKey = "appBlocker.pendingUnlock.v1"
   private let pendingInterceptsKey = "appBlocker.pendingIntercepts.v1"
+  // Persisted dedup for additive unlocks - repeating a successful request must
+  // not add the same session twice, even across JS reloads or app restarts.
+  // Bounded FIFO; ids only matter while a caller might still retry them.
+  private let appliedUnlockRequestsKey = "appBlocker.appliedUnlockRequests.v1"
+  private let maxAppliedUnlockRequests = 100
   private let minimumTemporaryUnlockMinutes = 1
   private var didLoadPersistedConfig = false
 
@@ -250,26 +255,7 @@ public class ExpoAppBlockerModule: Module {
         // blocked app is in the foreground, so it pauses on leave and resumes on
         // return. (See `startUsageBasedRelock`.) The budget is cleared at midnight.
         let budgetSeconds = sanitizedDurationMinutes * 60
-        let grantedAt = Date()
-        self.sharedDefaults?.set(budgetSeconds, forKey: self.temporaryUnlockKey)
-        self.sharedDefaults?.set(0, forKey: self.usageConsumedKey)
-        self.sharedDefaults?.set(grantedAt, forKey: self.unlockGrantedAtKey)
-
-        DispatchQueue.main.async {
-          self.store.shield.applications = nil
-          self.store.shield.applicationCategories = nil
-          self.store.shield.webDomains = nil
-        }
-
-        // Arm usage-threshold monitoring so the monitor re-blocks once measured
-        // blocked-app usage reaches the budget. Non-fatal if it can't start — the
-        // host-side relock (getRemainingUnlockTime poll / foreground check) is a
-        // backstop once the monitor reports consumption.
-        do {
-          try self.startUsageBasedRelock(budgetSeconds: budgetSeconds)
-        } catch {
-          print("[AppBlocker] startUsageBasedRelock failed: \(error.localizedDescription)")
-        }
+        let grantedAt = self.applyUnlockBudget(budgetSeconds: budgetSeconds)
 
         DispatchQueue.main.async {
           promise.resolve([
@@ -277,6 +263,79 @@ public class ExpoAppBlockerModule: Module {
             "expiresAt": grantedAt.addingTimeInterval(TimeInterval(budgetSeconds)).timeIntervalSince1970
           ])
         }
+      }
+    }
+
+    // Additive companion to `temporaryUnlock`: adds durationMinutes to the
+    // *remaining* budget instead of replacing it, at most once per requestId
+    // (persisted dedup). Always resolves a structured result - never rejects for
+    // expected failures - so the caller can explain every outcome.
+    AsyncFunction("addUnlockTime") { (durationMinutes: Int, requestId: String, promise: Promise) in
+      self.stateQueue.async {
+        self.ensureLoadedPersistedConfig()
+
+        let resolve: ([String: Any]) -> Void = { result in
+          DispatchQueue.main.async { promise.resolve(result) }
+        }
+        let fail: (String, String) -> Void = { status, message in
+          resolve([
+            "ok": false,
+            "status": status,
+            "remainingSeconds": self.remainingUnlockSeconds(),
+            "message": message,
+          ])
+        }
+
+        if durationMinutes <= 0 {
+          fail("invalid_request", "durationMinutes must be a positive number of minutes")
+          return
+        }
+        if requestId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+          fail("invalid_request", "requestId must be a non-empty stable identifier")
+          return
+        }
+        guard self.authCenter.authorizationStatus == .approved else {
+          fail("not_authorized", "Family Controls authorization not granted")
+          return
+        }
+        guard let config = self.currentBlockConfig, config.isActive else {
+          fail("blocking_inactive", "Blocking is not active")
+          return
+        }
+        guard !config.items.isEmpty else {
+          fail("no_blocked_apps", "No blocked apps selected")
+          return
+        }
+        guard self.sharedDefaults != nil else {
+          fail("native_error", "App Group storage unavailable")
+          return
+        }
+
+        if self.hasAppliedUnlockRequest(requestId) {
+          // The identical request already granted this time - report success
+          // without adding it a second time.
+          resolve([
+            "ok": true,
+            "status": "duplicate",
+            "remainingSeconds": self.remainingUnlockSeconds(),
+          ])
+          return
+        }
+
+        // Additive grant: the stored budget is the remaining seconds of a
+        // monitoring interval starting now, so carry over the current remainder
+        // and add on top, then re-arm thresholds for the combined total.
+        // Measured consumption is ~30s granular, so the carried-over remainder
+        // is approximate by that much.
+        let budgetSeconds = self.remainingUnlockSeconds() + durationMinutes * 60
+        _ = self.applyUnlockBudget(budgetSeconds: budgetSeconds)
+        self.recordAppliedUnlockRequest(requestId)
+
+        resolve([
+          "ok": true,
+          "status": "added",
+          "remainingSeconds": budgetSeconds,
+        ])
       }
     }
 
@@ -383,6 +442,51 @@ public class ExpoAppBlockerModule: Module {
   }
 
   // MARK: - Unlock State
+
+  /// Persist a fresh usage budget and arm enforcement. Shared by the replacing
+  /// grant (`temporaryUnlock`) and the additive grant (`addUnlockTime`) - the
+  /// only difference is how `budgetSeconds` is computed. The stored budget is
+  /// the remaining seconds for a monitoring interval that starts now, so
+  /// consumption is reset to 0 and `unlockGrantedAt` becomes the grant instant
+  /// (which also shields the monitor's premature-fire and spurious-DidEnd
+  /// guards). Returns the grant instant for the caller's expiresAt hint.
+  private func applyUnlockBudget(budgetSeconds: Int) -> Date {
+    let grantedAt = Date()
+    sharedDefaults?.set(budgetSeconds, forKey: temporaryUnlockKey)
+    sharedDefaults?.set(0, forKey: usageConsumedKey)
+    sharedDefaults?.set(grantedAt, forKey: unlockGrantedAtKey)
+
+    DispatchQueue.main.async {
+      self.store.shield.applications = nil
+      self.store.shield.applicationCategories = nil
+      self.store.shield.webDomains = nil
+    }
+
+    // Arm usage-threshold monitoring so the monitor re-blocks once measured
+    // blocked-app usage reaches the budget. Non-fatal if it can't start - the
+    // host-side relock (getRemainingUnlockTime poll / foreground check) is a
+    // backstop once the monitor reports consumption.
+    do {
+      try startUsageBasedRelock(budgetSeconds: budgetSeconds)
+    } catch {
+      print("[AppBlocker] startUsageBasedRelock failed: \(error.localizedDescription)")
+    }
+    return grantedAt
+  }
+
+  private func hasAppliedUnlockRequest(_ requestId: String) -> Bool {
+    let ids = sharedDefaults?.stringArray(forKey: appliedUnlockRequestsKey) ?? []
+    return ids.contains(requestId)
+  }
+
+  private func recordAppliedUnlockRequest(_ requestId: String) {
+    var ids = sharedDefaults?.stringArray(forKey: appliedUnlockRequestsKey) ?? []
+    ids.append(requestId)
+    if ids.count > maxAppliedUnlockRequests {
+      ids = Array(ids.suffix(maxAppliedUnlockRequests))
+    }
+    sharedDefaults?.set(ids, forKey: appliedUnlockRequestsKey)
+  }
 
   private func checkAndApplyUnlockState() {
     guard !isProcessingUnlockState else {

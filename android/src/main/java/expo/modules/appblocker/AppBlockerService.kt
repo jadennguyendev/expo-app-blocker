@@ -39,6 +39,15 @@ class AppBlockerService : Service() {
   }
 
   private fun tick() {
+    if (!hasUsageStatsAccess()) {
+      // Usage access was revoked - queryEvents would throw SecurityException and
+      // kill the whole process (the service shares it). Fail open: forget the
+      // last-seen app, pause consumption, drop any active block.
+      consumingSinceMs = 0L
+      currentForeground = null
+      clearBlock()
+      return
+    }
     getCurrentForegroundPackage()?.let { currentForeground = it }
     val foreground = currentForeground
 
@@ -85,6 +94,7 @@ class AppBlockerService : Service() {
   override fun onCreate() {
     super.onCreate()
     Log.d(TAG, "AppBlockerService onCreate")
+    AppBlockerPrefs.setMonitoringActive(this, true)
     overlayManager = OverlayManager(this)
     createChannelsIfNeeded()
     startForeground(NOTIFICATION_ID, buildNotification())
@@ -200,6 +210,7 @@ class AppBlockerService : Service() {
 
   override fun onDestroy() {
     Log.d(TAG, "AppBlockerService onDestroy")
+    AppBlockerPrefs.setMonitoringActive(this, false)
     handler.removeCallbacks(pollRunnable)
     overlayManager.hide()
     super.onDestroy()
@@ -210,7 +221,12 @@ class AppBlockerService : Service() {
       getSystemService(Context.USAGE_STATS_SERVICE) as UsageStatsManager
     val endTime = System.currentTimeMillis()
     val beginTime = endTime - LOOKBACK_WINDOW_MS
-    val events = usageStatsManager.queryEvents(beginTime, endTime)
+    // Guard the grant being revoked between the tick() check and this query.
+    val events = try {
+      usageStatsManager.queryEvents(beginTime, endTime)
+    } catch (e: SecurityException) {
+      return null
+    }
     val event = UsageEvents.Event()
     var latestForeground: String? = null
     while (events.hasNextEvent()) {

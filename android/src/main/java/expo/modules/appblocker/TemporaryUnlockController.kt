@@ -14,33 +14,65 @@ import android.content.Context
  * The budget is persisted (see [Store]) so the JS module can read it without
  * holding a reference to the running service, mirroring the iOS approach.
  *
- * [consume] and [grant] do a read-modify-write on the persisted budget and are
- * NOT atomic; the service drives both from the main thread (the poll Handler and
- * onStartCommand share that thread), which serializes them. Don't call these from
- * another thread without adding synchronization.
+ * All budget mutations are serialized on [Store.LOCK]: the service drives
+ * [consume]/[grant]/[clear] from the main thread while the module's
+ * [addBlocking] runs on the JS thread, so the lock is what keeps the
+ * additive read-modify-write exact.
  */
 class TemporaryUnlockController(private val context: Context) {
   /** True while earned time remains (blocking should be suppressed inside blocked apps). */
   val hasTimeLeft: Boolean
     get() = Store.remainingMs(context) > 0
 
+  /** Outcome of [addBlocking]. */
+  data class AddResult(val added: Boolean, val duplicate: Boolean, val remainingMs: Long)
+
   /** Grant a fresh budget of [durationMinutes], replacing any existing balance. No-op if <= 0. */
   fun grant(durationMinutes: Int) {
     if (durationMinutes <= 0) return
-    Store.setRemaining(context, durationMinutes * 60_000L)
+    synchronized(Store.LOCK) {
+      Store.setRemaining(context, durationMinutes * 60_000L)
+    }
+  }
+
+  /**
+   * Add [durationMs] to the remaining budget, at most once per [requestId].
+   * The check-and-add is one critical section so a retried request can never
+   * double-apply, even across a JS reload or app restart (the applied-ids set
+   * is persisted). Only successful additions are recorded - a request that
+   * failed upstream stays retryable.
+   */
+  fun addBlocking(durationMs: Long, requestId: String): AddResult {
+    synchronized(Store.LOCK) {
+      if (AppBlockerPrefs.hasAppliedUnlockRequest(context, requestId)) {
+        return AddResult(
+          added = false,
+          duplicate = true,
+          remainingMs = Store.remainingMs(context)
+        )
+      }
+      val remaining = Store.remainingMs(context) + durationMs
+      Store.setRemaining(context, remaining)
+      AppBlockerPrefs.recordAppliedUnlockRequest(context, requestId)
+      return AddResult(added = true, duplicate = false, remainingMs = remaining)
+    }
   }
 
   /** Spend [elapsedMs] of the budget (clamped at 0). Called while inside a blocked app. */
   fun consume(elapsedMs: Long) {
     if (elapsedMs <= 0) return
-    val remaining = Store.remainingMs(context)
-    if (remaining <= 0) return
-    Store.setRemaining(context, (remaining - elapsedMs).coerceAtLeast(0))
+    synchronized(Store.LOCK) {
+      val remaining = Store.remainingMs(context)
+      if (remaining <= 0) return
+      Store.setRemaining(context, (remaining - elapsedMs).coerceAtLeast(0))
+    }
   }
 
   /** Drop the entire budget immediately, restoring blocking. */
   fun clear() {
-    Store.setRemaining(context, 0)
+    synchronized(Store.LOCK) {
+      Store.setRemaining(context, 0)
+    }
   }
 
   /**
@@ -49,6 +81,7 @@ class TemporaryUnlockController(private val context: Context) {
    */
   companion object Store {
     private const val KEY_REMAINING_MS = "temporary_unlock_remaining_ms"
+    private val LOCK = Any()
 
     private fun setRemaining(context: Context, remainingMs: Long) {
       AppBlockerPrefs.get(context).edit().putLong(KEY_REMAINING_MS, remainingMs).apply()
@@ -58,6 +91,7 @@ class TemporaryUnlockController(private val context: Context) {
       AppBlockerPrefs.get(context).getLong(KEY_REMAINING_MS, 0L).coerceAtLeast(0L)
 
     /** Seconds of earned time remaining, or 0 if none. */
-    fun remainingSeconds(context: Context): Int = (remainingMs(context) / 1000).toInt()
+    fun remainingSeconds(context: Context): Int =
+      synchronized(LOCK) { (remainingMs(context) / 1000).toInt() }
   }
 }

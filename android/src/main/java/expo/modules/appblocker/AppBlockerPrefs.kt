@@ -30,6 +30,9 @@ object AppBlockerPrefs {
   private const val KEY_OVERLAY_SPINNER_COLOR = "overlay_spinner_color"
   private const val KEY_NOTIFICATION_TITLE = "notification_title"
   private const val KEY_NOTIFICATION_TEXT = "notification_text"
+  private const val KEY_MONITORING_ACTIVE = "monitoring_active"
+  private const val KEY_APPLIED_UNLOCK_REQUESTS = "applied_unlock_request_ids"
+  private const val MAX_APPLIED_UNLOCK_REQUESTS = 100
 
   fun get(context: Context): SharedPreferences =
     context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -185,6 +188,53 @@ object AppBlockerPrefs {
       .putLong(KEY_LAST_INTERCEPT_TS, interceptedAtMs)
       .apply()
   }
+
+  /**
+   * Whether the blocking service was started and not since stopped. Written by
+   * AppBlockerService onCreate/onDestroy; a force-stop can leave it stale-true
+   * until the service restarts (START_STICKY / boot receiver make that short),
+   * so treat it as best-effort, not a liveness guarantee.
+   */
+  fun isMonitoringActive(context: Context): Boolean =
+    get(context).getBoolean(KEY_MONITORING_ACTIVE, false)
+
+  fun setMonitoringActive(context: Context, active: Boolean) {
+    get(context).edit().putBoolean(KEY_MONITORING_ACTIVE, active).apply()
+  }
+
+  /** True if this additive-unlock request id was already applied. */
+  fun hasAppliedUnlockRequest(context: Context, requestId: String): Boolean {
+    val arr = readAppliedUnlockRequests(context)
+    for (i in 0 until arr.length()) {
+      if (arr.optString(i) == requestId) return true
+    }
+    return false
+  }
+
+  /**
+   * Record a successfully applied additive-unlock request id so a retried
+   * request is recognized and not applied twice. Bounded FIFO - ids are only
+   * meaningful while a caller might still retry them.
+   */
+  fun recordAppliedUnlockRequest(context: Context, requestId: String) {
+    val arr = readAppliedUnlockRequests(context)
+    arr.put(requestId)
+    val trimmed = if (arr.length() > MAX_APPLIED_UNLOCK_REQUESTS) {
+      JSONArray().also { t ->
+        for (i in (arr.length() - MAX_APPLIED_UNLOCK_REQUESTS) until arr.length()) t.put(arr.get(i))
+      }
+    } else {
+      arr
+    }
+    get(context).edit().putString(KEY_APPLIED_UNLOCK_REQUESTS, trimmed.toString()).apply()
+  }
+
+  private fun readAppliedUnlockRequests(context: Context): JSONArray =
+    try {
+      JSONArray(get(context).getString(KEY_APPLIED_UNLOCK_REQUESTS, "[]"))
+    } catch (e: Exception) {
+      JSONArray()
+    }
 
   /** Return and clear the queued block events. */
   fun drainIntercepts(context: Context): List<Map<String, Any>> {

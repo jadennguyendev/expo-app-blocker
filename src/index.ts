@@ -15,6 +15,8 @@ import type {
   IOSBlockedItem,
   IOSBlockConfiguration,
   TemporaryUnlockResult,
+  AddUnlockTimeResult,
+  AddUnlockTimeStatus,
   RelockResult,
   FamilyActivityPickerSelectionEvent,
   FamilyActivityPickerViewProps,
@@ -29,6 +31,8 @@ export type {
   IOSBlockedItem,
   IOSBlockConfiguration,
   TemporaryUnlockResult,
+  AddUnlockTimeResult,
+  AddUnlockTimeStatus,
   RelockResult,
   ShieldConfig,
   AndroidConfig,
@@ -181,6 +185,108 @@ export async function temporaryUnlock(durationMinutes: number = 15): Promise<Tem
     return { unlocked: true, expiresAt: Date.now() + durationMinutes * 60_000 };
   }
   return NativeModule.temporaryUnlock(durationMinutes);
+}
+
+const ADD_UNLOCK_TIME_STATUSES: readonly AddUnlockTimeStatus[] = [
+  "added",
+  "duplicate",
+  "not_authorized",
+  "no_blocked_apps",
+  "blocking_inactive",
+  "invalid_request",
+  "native_error",
+];
+
+function safeRemainingUnlockSeconds(): number {
+  try {
+    return getRemainingUnlockTime();
+  } catch {
+    return 0;
+  }
+}
+
+function addUnlockTimeFailure(
+  status: AddUnlockTimeStatus,
+  message: string
+): AddUnlockTimeResult {
+  return { ok: false, status, remainingSeconds: safeRemainingUnlockSeconds(), message };
+}
+
+function normalizeAddUnlockTimeResult(raw: unknown): AddUnlockTimeResult {
+  const partial = (raw ?? {}) as Partial<AddUnlockTimeResult>;
+  const status = ADD_UNLOCK_TIME_STATUSES.includes(partial.status as AddUnlockTimeStatus)
+    ? (partial.status as AddUnlockTimeStatus)
+    : "native_error";
+  return {
+    status,
+    ok:
+      typeof partial.ok === "boolean"
+        ? partial.ok
+        : status === "added" || status === "duplicate",
+    remainingSeconds:
+      typeof partial.remainingSeconds === "number" ? partial.remainingSeconds : 0,
+    ...(typeof partial.message === "string" ? { message: partial.message } : {}),
+  };
+}
+
+/**
+ * Add `durationMinutes` to the currently remaining usage budget instead of
+ * replacing it. The additive companion to `temporaryUnlock` (which replaces).
+ *
+ * Idempotent: `requestId` must be a stable identifier for the caller's
+ * unlock session (e.g. the batch/commit id that earned it). A repeat call
+ * with an already-applied `requestId` returns `{ status: "duplicate" }` and
+ * does NOT add the time again - the record persists natively, so retries
+ * survive JS reloads and app restarts.
+ *
+ * Never rejects: every outcome is a structured `AddUnlockTimeResult`
+ * (`not_authorized` / `no_blocked_apps` / `blocking_inactive` /
+ * `invalid_request` / `native_error`). A failed call consumes nothing and the
+ * same `requestId` may be retried.
+ *
+ * Android adds to the exact remaining ms budget. iOS re-arms threshold-based
+ * enforcement for `remaining + duration`; measured consumption is ~30s
+ * granular, so the carried-over remainder is approximate by that much.
+ */
+export async function addUnlockTime(
+  durationMinutes: number,
+  requestId: string
+): Promise<AddUnlockTimeResult> {
+  const minutes =
+    typeof durationMinutes === "number" && Number.isFinite(durationMinutes)
+      ? Math.round(durationMinutes)
+      : 0;
+  if (minutes <= 0) {
+    return addUnlockTimeFailure(
+      "invalid_request",
+      "durationMinutes must be a positive number of minutes"
+    );
+  }
+  if (typeof requestId !== "string" || requestId.trim().length === 0) {
+    return addUnlockTimeFailure(
+      "invalid_request",
+      "requestId must be a non-empty stable identifier"
+    );
+  }
+
+  try {
+    if (Platform.OS === "android") {
+      return normalizeAddUnlockTimeResult(
+        await NativeModule.addUnlockTimeAndroid(minutes, requestId)
+      );
+    }
+    if (Platform.OS === "ios") {
+      return normalizeAddUnlockTimeResult(
+        await NativeModule.addUnlockTime(minutes, requestId)
+      );
+    }
+    return addUnlockTimeFailure("native_error", "Unsupported platform");
+  } catch (e) {
+    return addUnlockTimeFailure(
+      "native_error",
+      e instanceof Error ? e.message : "Native call failed"
+    );
+  }
 }
 
 /** iOS only — returns `false` on Android. On Android use `getRemainingUnlockTime() > 0`. */

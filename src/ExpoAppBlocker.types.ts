@@ -60,6 +60,37 @@ export interface TemporaryUnlockResult {
   expiresAt: number;
 }
 
+/**
+ * Outcome of `addUnlockTime`. A single `status` covers both success shapes and
+ * every non-success the caller can act on, so callers never have to parse
+ * thrown errors to explain a failed unlock.
+ */
+export type AddUnlockTimeStatus =
+  /** The duration was added to the currently remaining usage budget. */
+  | "added"
+  /** The same `requestId` was already applied - nothing was added twice. */
+  | "duplicate"
+  /** Required permission is missing (Android overlay/usage-stats, iOS Family Controls). */
+  | "not_authorized"
+  /** No apps/categories are selected for blocking. */
+  | "no_blocked_apps"
+  /** Blocking itself is inactive (iOS config inactive/absent, Android monitor not running). */
+  | "blocking_inactive"
+  /** Bad arguments (non-positive duration or empty requestId). */
+  | "invalid_request"
+  /** The native side failed while applying the grant. */
+  | "native_error";
+
+export interface AddUnlockTimeResult {
+  status: AddUnlockTimeStatus;
+  /** True for "added" and "duplicate" - the requested time is in effect either way. */
+  ok: boolean;
+  /** Best-known remaining usage budget in seconds after the call. iOS is ~30s-granular. */
+  remainingSeconds: number;
+  /** Extra detail for logs/diagnostics - not user-facing copy. */
+  message?: string;
+}
+
 export interface RelockResult {
   locked: boolean;
 }

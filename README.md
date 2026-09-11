@@ -509,11 +509,37 @@ const seconds = getRemainingUnlockTime(); // seconds of budget remaining, 0 if n
 await relockApps();                        // drop the budget now, re-block immediately
 ```
 
+#### Adding to the remaining budget (`addUnlockTime`)
+
+`temporaryUnlock(minutes)` **replaces** the budget. When a flow earns time
+repeatedly (e.g. per completed challenge), use `addUnlockTime` instead - it
+adds the duration to whatever remains and is safe to retry:
+
+```typescript
+import { addUnlockTime } from 'expo-app-blocker';
+
+const result = await addUnlockTime(5, 'session-or-batch-id');
+// { ok: true,  status: 'added',     remainingSeconds: 300 }
+// { ok: true,  status: 'duplicate', remainingSeconds: 300 }  - requestId already applied
+// { ok: false, status: 'not_authorized' | 'no_blocked_apps' | 'blocking_inactive'
+//             | 'invalid_request' | 'native_error', message?: string }
+```
+
+- `requestId` must be a **stable identifier for the thing that earned the
+  time** (batch id, session id, …). The applied-id record is persisted
+  natively, so a retried request cannot add the same time twice - even across
+  JS reloads and app restarts. Only successful additions are recorded; a
+  failed request stays retryable.
+- The call **never rejects** - inspect `result.status` for the outcome.
+- `remainingSeconds` is the best-known remaining budget: exact on Android,
+  ~30-second granular on iOS (see table below).
+
 **How each platform enforces it:**
 
 | | Android | iOS |
 |---|---|---|
 | Mechanism | Foreground-service poll consumes the budget each tick spent inside a blocked app | DeviceActivity usage-threshold events stepped ~every 30s of the budget; the monitor extension records consumed seconds and re-applies the shield on the final step |
+| `addUnlockTime` | Exact - adds ms to the persisted remaining budget under a lock shared with consumption | Re-arms threshold monitoring for `remaining + added` seconds; the carried-over remainder is ~30s-granular (consumption is only measured at step thresholds) |
 | `getRemainingUnlockTime()` | Live — ticks down by the second while inside a blocked app, freezes otherwise | **~30s-granular** — steps down as measured usage accrues (the monitor writes consumed seconds to the App Group), freezes when the apps aren't used |
 | `isTemporarilyUnlocked()` | Returns `false` (use `getRemainingUnlockTime() > 0`) | `true` while budget remains |
 | Caveats | — | Apple thresholds are coarse/unreliable below ~a minute, so the finest steps may fire late or be skipped (later steps + the final threshold still re-block, bounding overshoot to ~one step); large budgets auto-coarsen the step to stay under the event cap; unspent budget is cleared at the daily boundary (midnight) by the DeviceActivity monitor (`intervalDidEnd` of the unlock schedule, plus `intervalDidStart` of a repeating all-day activity) so the shield re-applies even if the host app is not in the foreground |

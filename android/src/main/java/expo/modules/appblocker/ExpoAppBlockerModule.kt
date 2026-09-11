@@ -38,13 +38,7 @@ class ExpoAppBlockerModule : Module() {
     }
 
     AsyncFunction("checkUsageStatsPermission") {
-      val appOps = context.getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
-      val mode = appOps.unsafeCheckOpNoThrow(
-        AppOpsManager.OPSTR_GET_USAGE_STATS,
-        Process.myUid(),
-        context.packageName
-      )
-      mode == AppOpsManager.MODE_ALLOWED
+      hasUsageStatsPermission()
     }
 
     AsyncFunction("checkNotificationPermission") {
@@ -122,6 +116,13 @@ class ExpoAppBlockerModule : Module() {
       Log.d(TAG, "temporaryUnlockAndroid: $durationMinutes minutes")
     }
 
+    // Additive unlock: adds durationMinutes to the *remaining* budget instead of
+    // replacing it, at most once per requestId (dedup is persisted). Always
+    // returns a structured result map - never throws for expected failures.
+    Function("addUnlockTimeAndroid") { durationMinutes: Int, requestId: String ->
+      addUnlockTime(durationMinutes, requestId)
+    }
+
     Function("relockAndroid") {
       AppBlockerService.relock(context)
       Log.d(TAG, "relockAndroid")
@@ -194,6 +195,58 @@ class ExpoAppBlockerModule : Module() {
           "iconBase64" to iconBase64
         )
       }.sortedBy { it["name"]?.toString()?.lowercase() }
+    }
+  }
+
+  private fun hasUsageStatsPermission(): Boolean = context.hasUsageStatsAccess()
+
+  /**
+   * Structured additive-unlock result for JS. `status` mirrors the TS
+   * AddUnlockTimeStatus union: added / duplicate / not_authorized /
+   * no_blocked_apps / blocking_inactive / invalid_request / native_error.
+   *
+   * The write goes straight to the persisted budget under the controller's
+   * lock - the running service picks it up on its next poll tick (<= 500ms),
+   * so no service intent is needed. The monitoring-active check is the
+   * persisted flag (see AppBlockerPrefs) - best-effort liveness, consistent
+   * with the "service auto-starts on app/boot" enforcement model.
+   */
+  private fun addUnlockTime(durationMinutes: Int, requestId: String): Map<String, Any?> {
+    fun fail(status: String, message: String): Map<String, Any?> = mapOf(
+      "ok" to false,
+      "status" to status,
+      "remainingSeconds" to TemporaryUnlockController.remainingSeconds(context),
+      "message" to message,
+    )
+
+    if (durationMinutes <= 0) {
+      return fail("invalid_request", "durationMinutes must be a positive number of minutes")
+    }
+    if (requestId.isBlank()) {
+      return fail("invalid_request", "requestId must be a non-empty stable identifier")
+    }
+
+    return try {
+      if (!Settings.canDrawOverlays(context) || !hasUsageStatsPermission()) {
+        return fail("not_authorized", "Overlay and usage-stats permissions are required")
+      }
+      if (AppBlockerPrefs.getBlockedPackages(context).isEmpty()) {
+        return fail("no_blocked_apps", "No blocked apps selected")
+      }
+      if (!AppBlockerPrefs.isMonitoringActive(context)) {
+        return fail("blocking_inactive", "Blocking monitor is not running")
+      }
+
+      val result = TemporaryUnlockController(context)
+        .addBlocking(durationMinutes * 60_000L, requestId)
+      mapOf(
+        "ok" to true,
+        "status" to (if (result.duplicate) "duplicate" else "added"),
+        "remainingSeconds" to (result.remainingMs / 1000L).toInt(),
+      )
+    } catch (e: Exception) {
+      Log.e(TAG, "addUnlockTimeAndroid failed", e)
+      fail("native_error", e.message ?: "Native add-unlock failed")
     }
   }
 
